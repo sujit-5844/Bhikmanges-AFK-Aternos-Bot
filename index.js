@@ -1087,7 +1087,7 @@ function formatUptime(seconds) {
 // SELF-PING - Prevent Render from sleeping
 // FIX: only ping if RENDER_EXTERNAL_URL is set (skip useless localhost ping)
 // ============================================================
-const SELF_PING_INTERVAL = 10 * 60 * 1000;
+const SELF_PING_INTERVAL = 4 * 60 * 1000; // FIX: was 10min — Render free tier sleeps at ~15min of inactivity. 4min is safe.
 
 function startSelfPing() {
   const renderUrl = process.env.RENDER_EXTERNAL_URL;
@@ -1173,9 +1173,10 @@ function getReconnectDelay() {
     return throttleDelay;
   }
 
-  // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
-  const maxDelay = config.utils["max-reconnect-delay"] || 30000;
+  // FIX: use a 15s base delay minimum on Render — Aternos takes time to start up
+  // and spamming reconnects too fast causes ETIMEDOUT cascades.
+  const baseDelay = Math.max(config.utils["auto-reconnect-delay"] || 15000, 15000);
+  const maxDelay = config.utils["max-reconnect-delay"] || 120000;
   const delay = Math.min(
     baseDelay * Math.pow(2, botState.reconnectAttempts),
     maxDelay,
@@ -1190,6 +1191,22 @@ function createBot() {
     return;
   }
 
+  // FIX: DNS pre-check before attempting mineflayer connect.
+  // On Render, Aternos hostnames can fail to resolve during server startup,
+  // causing immediate ETIMEDOUT. We probe DNS first and retry if unresolved.
+  const dns = require("dns");
+  dns.lookup(config.server.ip, (dnsErr) => {
+    if (dnsErr) {
+      addLog(`[Bot] DNS lookup failed for "${config.server.ip}": ${dnsErr.message} — will retry`);
+      isReconnecting = false; // allow scheduleReconnect to re-enter
+      scheduleReconnect();
+      return;
+    }
+    _createBotInternal();
+  });
+}
+
+function _createBotInternal() {
   // Cleanup previous bot properly to avoid ghost bots
   if (bot) {
     clearAllIntervals();
@@ -1206,12 +1223,11 @@ function createBot() {
   addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
 
   try {
-    // FIX: use version:false to auto-detect server version so the bot can join any server.
-    // If the user explicitly sets a version in settings.json it is still respected.
-    const botVersion =
-      config.server.version && config.server.version.trim() !== ""
-        ? config.server.version
-        : false;
+    // Version can be old-style "1.21.1" or new year-based "26.1.1" (Mojang's 2026+ numbering).
+    // Use false to auto-detect if not set.
+    const rawVersion = (config.server.version || "").trim();
+    const botVersion = rawVersion !== "" ? rawVersion : false;
+    addLog(`[Bot] Using version: ${botVersion || "auto-detect"}`);
     bot = mineflayer.createBot({
       username: config["bot-account"].username,
       password: config["bot-account"].password || undefined,
@@ -1220,7 +1236,9 @@ function createBot() {
       port: config.server.port,
       version: botVersion,
       hideErrors: false,
-      checkTimeoutInterval: 600000,
+      checkTimeoutInterval: 30000, // FIX: was 600000 (10min) — Render kills idle TCP before that. 30s detects dead connections fast.
+      // FIX: enable TCP keepalive so Render's load balancer doesn't silently drop idle MC connections
+      keepAlive: true,
     });
 
     bot.loadPlugin(pathfinder);
@@ -2067,7 +2085,7 @@ process.on("SIGINT", () => {
 // START THE BOT
 // ============================================================
 addLog("=".repeat(50));
-addLog("  Minecraft AFK Bot v2.5 - Bug-Fixed Edition");
+addLog("  Minecraft AFK Bot v2.6 - Render/ETIMEDOUT Hardened");
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
 addLog(`Version: ${config.server.version}`);
